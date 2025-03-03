@@ -10,6 +10,7 @@ import { runJxa } from "run-jxa";
 import path from "node:path";
 import os from "node:os";
 import TurndownService from "turndown";
+import fs from "node:fs/promises";
 import {
   EmbeddingFunction,
   LanceSchema,
@@ -122,7 +123,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            query: z.string(),
+            query: { type: "string" },
           },
           required: ["query"],
         },
@@ -144,35 +145,126 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-const getNotes = async () => {
-  const notes = await runJxa(`
-    const app = Application('Notes');
-app.includeStandardAdditions = true;
-const notes = Array.from(app.notes());
-const titles = notes.map(note => note.properties().name);
-return titles;
-  `);
+// Define the data directory
+const DATA_DIR = path.join(os.homedir(), ".mcp-apple-notes");
+const STATE_FILE = path.join(DATA_DIR, "indexing-state.json");
 
-  return notes as string[];
+// Create the data directory if it doesn't exist
+(async () => {
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+  } catch (error) {
+    console.error(`Error creating data directory: ${error.message}`);
+  }
+})();
+
+// Define the indexing state interface
+interface IndexingState {
+  inProgress: boolean;
+  totalNotes: number;
+  processedNotes: number;
+  lastProcessedIndex: number;
+  startTime: number;
+  lastUpdateTime: number;
+  errors: string[];
+  batchSize: number;
+}
+
+// Initialize default state
+const defaultState: IndexingState = {
+  inProgress: false,
+  totalNotes: 0,
+  processedNotes: 0,
+  lastProcessedIndex: -1,
+  startTime: 0,
+  lastUpdateTime: 0,
+  errors: [],
+  batchSize: 5,
+};
+
+// Function to read the current indexing state
+async function getIndexingState(): Promise<IndexingState> {
+  try {
+    const data = await fs.readFile(STATE_FILE, 'utf-8');
+    return JSON.parse(data) as IndexingState;
+  } catch (error) {
+    // If the file doesn't exist or can't be read, return the default state
+    return { ...defaultState };
+  }
+}
+
+// Function to save the current indexing state
+async function saveIndexingState(state: IndexingState): Promise<void> {
+  try {
+    await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+  } catch (error) {
+    console.error(`Error saving indexing state: ${error.message}`);
+  }
+}
+
+// Function to get the status of the indexing process
+async function getIndexingStatus(): Promise<{
+  inProgress: boolean;
+  progress: number;
+  processedNotes: number;
+  totalNotes: number;
+  elapsedTime: number;
+  errors: string[];
+}> {
+  const state = await getIndexingState();
+  const progress = state.totalNotes > 0 
+    ? Math.round((state.processedNotes / state.totalNotes) * 100) 
+    : 0;
+  
+  return {
+    inProgress: state.inProgress,
+    progress,
+    processedNotes: state.processedNotes,
+    totalNotes: state.totalNotes,
+    elapsedTime: state.inProgress ? Date.now() - state.startTime : 0,
+    errors: state.errors,
+  };
+}
+
+const getNotes = async () => {
+  console.error("Executing JXA to get notes list...");
+  try {
+    const notes = await runJxa(`
+      try {
+        const app = Application('Notes');
+        app.includeStandardAdditions = true;
+        
+        const allNotes = Array.from(app.notes());
+        const titles = allNotes.map(note => note.properties().name);
+        
+        return titles;
+      } catch (error) {
+        return JSON.stringify({ error: error.toString() });
+      }
+    `);
+    
+    // Check if we got an error object
+    if (typeof notes === 'string' && notes.includes('"error":')) {
+      const errorObj = JSON.parse(notes);
+      console.error(`JXA error: ${errorObj.error}`);
+      return [];
+    }
+    
+    console.error(`JXA returned ${Array.isArray(notes) ? notes.length : 0} notes`);
+    return notes as string[];
+  } catch (error) {
+    console.error(`Error in getNotes: ${error.message}`);
+    return [];
+  }
 };
 
 const getNoteDetailsByTitle = async (title: string) => {
-  console.error(`Getting details for note: "${title}"`);
-  try {
-    // Escape special characters in the title
-    const escapedTitle = title.replace(/[\\'"]/g, "\\$&");
+  const note = await runJxa(
+    `const app = Application('Notes');
+    const title = "${title}"
     
-    const note = await runJxa(
-      `
-      try {
-        const app = Application('Notes');
-        const title = "${escapedTitle}";
-        
+    try {
         const note = app.notes.whose({name: title})[0];
-        
-        if (!note) {
-          return JSON.stringify({ error: "Note not found" });
-        }
         
         const noteInfo = {
             title: note.name(),
@@ -182,32 +274,138 @@ const getNoteDetailsByTitle = async (title: string) => {
         };
         
         return JSON.stringify(noteInfo);
-      } catch (error) {
-        return JSON.stringify({ error: error.toString() });
+    } catch (error) {
+        return "{}";
+    }`
+  );
+
+  return JSON.parse(note as string) as {
+    title: string;
+    content: string;
+    creation_date: string;
+    modification_date: string;
+  };
+};
+
+// Background indexing function that processes notes in batches
+async function backgroundIndexNotes(notesTable: lancedb.Table): Promise<void> {
+  // Get the current state or initialize a new one
+  let state = await getIndexingState();
+  
+  // If indexing is already in progress, don't start again
+  if (state.inProgress) {
+    console.error("Indexing is already in progress");
+    return;
+  }
+  
+  // Initialize the state for a new indexing run
+  const allNotes = await getNotes();
+  state = {
+    ...defaultState,
+    inProgress: true,
+    totalNotes: allNotes.length,
+    startTime: Date.now(),
+    lastUpdateTime: Date.now(),
+  };
+  
+  // Save the initial state
+  await saveIndexingState(state);
+  
+  // Process notes in batches
+  console.error(`Starting background indexing of ${allNotes.length} notes in batches of ${state.batchSize}`);
+  
+  try {
+    for (let i = 0; i < allNotes.length; i += state.batchSize) {
+      // Update the state
+      state.lastProcessedIndex = i;
+      state.lastUpdateTime = Date.now();
+      await saveIndexingState(state);
+      
+      // Get the current batch
+      const batch = allNotes.slice(i, i + state.batchSize);
+      console.error(`Processing batch ${Math.floor(i/state.batchSize) + 1} of ${Math.ceil(allNotes.length/state.batchSize)}`);
+      
+      // Process the batch
+      const batchDetails = await Promise.all(
+        batch.map(async (noteTitle) => {
+          try {
+            console.error(`Getting details for note: "${noteTitle}"`);
+            const details = await getNoteDetailsByTitle(noteTitle);
+            return details;
+          } catch (error) {
+            const errorMsg = `Error getting note details for ${noteTitle}: ${error.message}`;
+            console.error(errorMsg);
+            state.errors.push(errorMsg);
+            return null;
+          }
+        })
+      );
+      
+      // Filter out null results and process the notes
+      const validDetails = batchDetails.filter(Boolean);
+      console.error(`Got ${validDetails.length} valid notes in this batch`);
+      
+      if (validDetails.length > 0) {
+        // Convert HTML to Markdown and prepare for database
+        const batchChunks = validDetails.map((note, index) => {
+          try {
+            // TypeScript non-null assertion to handle the null check we already did with filter(Boolean)
+            return {
+              id: (i + index).toString(),
+              title: note!.title || "Untitled",
+              content: note!.content ? turndown(note!.content) : "",
+              creation_date: note!.creation_date || new Date().toISOString(),
+              modification_date: note!.modification_date || new Date().toISOString(),
+            };
+          } catch (error) {
+            const errorMsg = `Error processing note ${note!.title}: ${error.message}`;
+            console.error(errorMsg);
+            state.errors.push(errorMsg);
+            return {
+              id: (i + index).toString(),
+              title: note!.title || "Untitled",
+              content: note!.content || "",
+              creation_date: note!.creation_date || new Date().toISOString(),
+              modification_date: note!.modification_date || new Date().toISOString(),
+            };
+          }
+        });
+        
+        // Add to database
+        try {
+          console.error(`Adding ${batchChunks.length} notes to database`);
+          await notesTable.add(batchChunks);
+          console.error("Successfully added batch to database");
+          
+          // Update progress
+          state.processedNotes += batchChunks.length;
+          await saveIndexingState(state);
+        } catch (error) {
+          const errorMsg = `Error adding batch to database: ${error.message}`;
+          console.error(errorMsg);
+          state.errors.push(errorMsg);
+        }
       }
-      `
-    );
-    
-    // Check if we got an error object
-    if (typeof note === 'string' && note.includes('"error":')) {
-      const errorObj = JSON.parse(note);
-      console.error(`JXA error for note "${title}": ${errorObj.error}`);
-      return { title, content: "", creation_date: "", modification_date: "" };
+      
+      // Small delay between batches to prevent overloading
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
     
-    const parsedNote = JSON.parse(note as string);
-    console.error(`Successfully got details for note: "${title}"`);
-    return parsedNote as {
-      title: string;
-      content: string;
-      creation_date: string;
-      modification_date: string;
-    };
+    // Indexing complete
+    state.inProgress = false;
+    state.lastUpdateTime = Date.now();
+    await saveIndexingState(state);
+    console.error(`Indexing completed. Processed ${state.processedNotes} notes out of ${state.totalNotes}`);
   } catch (error) {
-    console.error(`Error in getNoteDetailsByTitle for "${title}": ${error.message}`);
-    return { title, content: "", creation_date: "", modification_date: "" };
+    // Handle any unexpected errors
+    const errorMsg = `Unexpected error during indexing: ${error.message}`;
+    console.error(errorMsg);
+    state.errors.push(errorMsg);
+    state.inProgress = false;
+    state.lastUpdateTime = Date.now();
+    await saveIndexingState(state);
   }
-};
+}
 
 export const indexNotes = async (notesTable: any) => {
   const start = performance.now();
@@ -320,82 +518,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
         return createTextResponse(error.message);
       }
     } else if (name === "index-notes") {
-      // Simplified indexing approach to avoid timeout
-      try {
-        console.error("Starting ultra-simplified indexing process...");
-        
-        // Get just a single note for testing
-        const jxaScript = `
-          try {
-            const app = Application('Notes');
-            app.includeStandardAdditions = true;
-            
-            // Only get the first note for testing
-            const allNotes = app.notes();
-            if (allNotes.length === 0) {
-              return JSON.stringify([]);
-            }
-            
-            const note = allNotes[0];
-            try {
-              return JSON.stringify([{
-                title: note.name(),
-                content: "Test content", // Simplified content to avoid timeout
-                creation_date: new Date().toLocaleString(),
-                modification_date: new Date().toLocaleString()
-              }]);
-            } catch (e) {
-              return JSON.stringify([]);
-            }
-          } catch (error) {
-            return JSON.stringify({ error: error.toString() });
-          }
-        `;
-        
-        console.error("Executing simplified JXA to get a single note...");
-        const notesResult = await runJxa(jxaScript);
-        
-        let notes: Array<{
-          title?: string;
-          content?: string;
-          creation_date?: string;
-          modification_date?: string;
-        }> = [];
-        
-        if (typeof notesResult === 'string') {
-          if (notesResult.includes('"error":')) {
-            console.error(`JXA error: ${JSON.parse(notesResult).error}`);
-            return createTextResponse("Failed to index notes due to JXA error. Please try again.");
-          }
-          notes = JSON.parse(notesResult);
-        }
-        
-        console.error(`Got ${notes.length} notes from JXA`);
-        
-        if (notes.length === 0) {
-          return createTextResponse("No notes found to index.");
-        }
-        
-        // Process notes - simplified to avoid timeout
-        const chunks = notes.map((note, index) => ({
-          id: index.toString(),
-          title: note.title || "Untitled",
-          content: note.content || "Test content",
-          creation_date: note.creation_date || new Date().toISOString(),
-          modification_date: note.modification_date || new Date().toISOString(),
-        }));
-        
-        console.error(`Adding ${chunks.length} notes to database...`);
-        await notesTable.add(chunks);
-        console.error("Successfully added notes to database");
-        
+      // Start the background indexing process
+      const status = await getIndexingStatus();
+      
+      if (status.inProgress) {
         return createTextResponse(
-          `Indexed ${chunks.length} test notes. You can now search for them using the "search-notes" tool.`
+          `Indexing is already in progress. Progress: ${status.progress}% (${status.processedNotes}/${status.totalNotes} notes processed)`
         );
-      } catch (error) {
-        console.error(`Indexing error: ${error.message}`);
-        return createTextResponse(`Error indexing notes: ${error.message}`);
       }
+      
+      // Start the background indexing process
+      backgroundIndexNotes(notesTable).catch(error => {
+        console.error(`Background indexing error: ${error.message}`);
+      });
+      
+      return createTextResponse(
+        `Started indexing your Apple Notes in the background. This process will continue even if you close this chat. You can check the status by using the "index-notes" tool again.`
+      );
     } else if (name === "search-notes") {
       const { query } = QueryNotesSchema.parse(args);
       const combinedResults = await searchAndCombineResults(notesTable, query);
