@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/tom-semple-mcp-apple-notes-fixed-badge.png)](https://mseep.ai/app/tom-semple-mcp-apple-notes-fixed)
+
 # MCP Apple Notes
 
 ![MCP Apple Notes](./images/logo.png)
